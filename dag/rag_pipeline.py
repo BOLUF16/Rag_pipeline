@@ -1,25 +1,22 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import dag, task
 import logging
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
 from langchain_mongodb import MongoDBAtlasVectorSearch 
-from langchain_core.prompts import ChatPromptTemplate
 from pymongo.operations import SearchIndexModel
 import pymongo
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from textwrap import dedent
 import os
 
 
-load_dotenv()
-MONGO_URI = os.environ["MONGO_URI"] # Retrieve MongoDB URI from environment variables
-HF_KEY = os.environ["HF_KEY"] # Hugging Face API key for embeddings model
+load_dotenv('.env')
+MONGO_URI = os.getenv("MONGO_URI") # Retrieve MongoDB URI from environment variables
+HF_KEY = os.getenv("HF_KEY") # Hugging Face API key for embeddings model
 
-PDF_DIR = "../../data"
-PROCESSED_FILES_LOG = "../../log/processed_files.log"
+PDF_DIR = "/usr/local/airflow/data"
+PROCESSED_FILES_LOG = "/usr/local/airflow/log/processed_files.log"
 
 client = pymongo.MongoClient(MONGO_URI)
 
@@ -37,17 +34,17 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-with DAG(
-        "Rag_Pipeline",
-        default_args=default_args,
-        schedule_interval=timedelta(minutes=5),
-        catchup=False,
-        description= "A Dag to ingest, split and embed new pdfs into Mongodb every 5 minutes"
-)as dag:
-    
-    dag.doc_md = __doc__
+@dag(
+    default_args=default_args,
+    schedule_interval=timedelta(minutes=5),
+    catchup=False,
+    description="A DAG to ingest, split, and embed new PDFs into MongoDB every 5 minutes",
+)
 
-    def check_for_new_documents(**kwargs):
+def pdf_ingestion_and_embedding():
+
+    @task
+    def check_for_new_documents():
 
         if os.path.exists(PROCESSED_FILES_LOG):
             with open(PROCESSED_FILES_LOG, "r") as f:
@@ -65,10 +62,12 @@ with DAG(
             logging.info("No new pdfs found")
             return []
     
+    
+    @task
     def process_pdfs(new_pdfs):
         if not new_pdfs:
             logging.info("No new pdfs to process")
-            return []
+            return 
         
         all_chunks = []
 
@@ -87,73 +86,49 @@ with DAG(
             model_name="BAAI/bge-small-en-v1.5"
         )
 
-        
-        vector_store = MongoDBAtlasVectorSearch(
+        existing_indexes = MONGODB_COLLECTION.list_search_indexes()
+        list_index = [f for f in existing_indexes]
+           
+        search_index_model = SearchIndexModel(
+                    definition={
+                        "fields": [
+                            {
+                            "type": "vector",
+                            "path": "embedding",
+                            "numDimensions": 384,
+                            "similarity": "cosine"
+                            },
+                            {
+                            "type": "filter",
+                            "path": "page"
+                            }
+                        ]
+                    },
+                    name="ragpipeline",
+                    type="vectorSearch"
+                    )
+                    
+        logging.info("Generating embeddings")
+        vector_store = MongoDBAtlasVectorSearch.from_documents(
+            documents=all_chunks,
             collection=MONGODB_COLLECTION,
             embedding=embeddings,
             index_name=ATLAS_VECTOR_SEARCH_INDEX_NAME,
             relevance_score_fn="cosine",
         )
-        
+        if list_index == []:
+            logging.info(f"Creating {ATLAS_VECTOR_SEARCH_INDEX_NAME} search index")
+            MONGODB_COLLECTION.create_search_index(model=search_index_model)
+            logging.info(f"{ATLAS_VECTOR_SEARCH_INDEX_NAME} search index created")
+    
+        logging.info("Embedding generation completed")
+
         logging.info("data uploaded")
         with open(PROCESSED_FILES_LOG, "a") as f:
             for pdf in new_pdfs:
                 f.write(pdf + "\n")
-    
+       
+    new_pdfs = check_for_new_documents()
+    process_pdfs(new_pdfs)
 
-    def create_vector_search(**kwargs):
-        search_index_model = SearchIndexModel(
-        definition={
-            "fields": [
-                {
-                "type": "vector",
-                "path": "embedding",
-                "numDimensions": 384,
-                "similarity": "cosine"
-                },
-                {
-                "type": "filter",
-                "path": "page"
-                }
-            ]
-        },
-        name="ragpipeline",
-        type="vectorSearch"
-        )
-         
-        MONGODB_COLLECTION.create_search_index(model=search_index_model)
-    
-    check_for_new_documents_task = PythonOperator(
-        task_id = "check_for_new_document",
-        python_callable=check_for_new_documents,
-    )
-    check_for_new_documents_task.doc_md = dedent(
-        """\
-        #### checking task
-        this task checks for new documents.
-        """
-    )
-
-    process_pdfs_task = PythonOperator(
-        task_id = "process_pdf",
-        python_callable=process_pdfs,
-    )
-    process_pdfs_task.doc_md = dedent(
-        """\
-        #### processing task
-        this task split and embed new documents into mongodb
-        """
-    )
-
-    create_vector_search_task = PythonOperator(
-        task_id = "create_vector_search",
-        python_callable=create_vector_search,
-    )
-    create_vector_search_task.doc_md = dedent(
-        """\
-        #### create vector search task
-        this task creates vector search index
-        """
-    )
-
-check_for_new_documents_task >> process_pdfs_task >> create_vector_search_task
+dag = pdf_ingestion_and_embedding()

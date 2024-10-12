@@ -1,0 +1,10 @@
+version: "3.1"
+services:
+  scheduler:
+    image: airflow-mongodb-pdf-pipeline
+    container_name: airflow-mongodb-pdf-pipeline
+    ports:
+      - "8080:8080"
+    volumes:
+      - C:/Users/Bolu/Rag_pipeline/data:/usr/local/airflow/data  
+      - C:/Users/Bolu/Rag_pipeline/log:/usr/local/airflow/log   
